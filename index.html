@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Tank Strike: Landscape Pro</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body, html { 
+            margin: 0; padding: 0; width: 100%; height: 100%; 
+            background: #000; overflow: hidden; touch-action: none; 
+            font-family: 'Arial Black', sans-serif;
+        }
+        /* The Canvas fills the entire screen */
+        canvas { display: block; width: 100vw; height: 100vh; background: #0a0a0a; }
+
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 20; }
+        #ui-layer > * { pointer-events: auto; }
+
+        #menu, #game-over { 
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+            background: rgba(15, 15, 15, 0.95); padding: 30px; border-radius: 20px; 
+            text-align: center; border: 4px solid #2ecc71; width: 320px; box-shadow: 0 0 30px rgba(46, 204, 113, 0.3);
+        }
+        #game-over { display: none; border-color: #f1c40f; }
+        
+        .controls { display: flex; flex-direction: column; gap: 12px; }
+        input { padding: 15px; border-radius: 10px; border: none; background: #222; color: #fff; text-align: center; font-size: 24px; width: 100%; }
+        button { padding: 15px; cursor: pointer; background: #2ecc71; border: none; color: white; font-weight: bold; border-radius: 10px; text-transform: uppercase; font-size: 16px; }
+        
+        #host-id-display { margin: 10px 0; color: #f1c40f; font-size: 40px; letter-spacing: 5px; }
+        
+        .joystick-container { position: absolute; bottom: 10%; width: 130px; height: 130px; background: rgba(255,255,255,0.05); border-radius: 50%; display: none; border: 2px solid rgba(255,255,255,0.1); }
+        #move-stick { left: 50px; }
+        #fire-stick { right: 50px; }
+        .stick { position: absolute; width: 55px; height: 55px; background: rgba(255,255,255,0.3); border-radius: 50%; top: 37.5px; left: 37.5px; }
+        
+        #announcer { position: absolute; top: 20%; width: 100%; text-align: center; font-size: 45px; color: #f1c40f; font-weight: 900; display: none; text-shadow: 3px 3px #000; }
+        #leave-btn { position: absolute; top: 20px; right: 20px; background: #e74c3c; padding: 10px 20px; display: none; border: none; border-radius: 8px; color: white; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div id="ui-layer">
+    <div id="announcer">SMASHER!</div>
+    <button id="leave-btn" onclick="location.reload()">EXIT</button>
+
+    <div id="menu">
+        <h1 style="margin:0 0 15px 0; color:#2ecc71; font-size: 22px;">TANK STRIKE: PRO</h1>
+        <div class="controls">
+            <button onclick="requestFullscreen(); startHost();">HOST MATCH</button>
+            <div id="host-id-display">----</div>
+            <input type="number" id="join-id" placeholder="CODE">
+            <button style="background:#3498db" onclick="requestFullscreen(); startJoin();">JOIN MATCH</button>
+        </div>
+        <p style="font-size: 10px; color: #666; margin-top: 15px;">Game will enter Fullscreen Landscape</p>
+    </div>
+
+    <div id="game-over">
+        <h1 id="result-text" style="font-size: 40px; margin: 0 0 20px 0;">WASTED</h1>
+        <button id="restart-btn" style="background:#f39c12; width:100%; display:none;" onclick="hostRequestReset()">PLAY AGAIN</button>
+    </div>
+
+    <div id="move-stick" class="joystick-container"><div class="stick"></div></div>
+    <div id="fire-stick" class="joystick-container"><div class="stick"></div></div>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    
+    // Virtual resolution for logic
+    const GAME_W = 1600; 
+    const GAME_H = 900;  
+    let scale = 1, obstacles = [], peer, conn, isHost = false, gameRunning = false, lastFire = 0;
+    let perk = null, perkTimer = 0, lastContactDamage = 0;
+
+    // --- FULLSCREEN & LANDSCAPE LOCK ---
+    async function requestFullscreen() {
+        const el = document.documentElement;
+        try {
+            if (el.requestFullscreen) await el.requestFullscreen();
+            else if (el.webkitRequestFullscreen) await el.webkitRequestFullscreen();
+            
+            if (screen.orientation && screen.orientation.lock) {
+                await screen.orientation.lock('landscape').catch(e => console.log("Orientation lock ignored"));
+            }
+        } catch (err) { console.log("Fullscreen/Lock failed", err); }
+    }
+
+    function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        scale = Math.min(canvas.width / GAME_W, canvas.height / GAME_H);
+        ctx.setTransform(scale, 0, 0, scale, (canvas.width - GAME_W * scale) / 2, (canvas.height - GAME_H * scale) / 2);
+    }
+    window.addEventListener('resize', resize);
+    window.addEventListener('orientationchange', resize);
+    resize();
+
+    // --- PLAYER FACTORY ---
+    const createPlayer = (x, y, color, angle) => ({
+        x, y, angle, color, bullets: [], hp: 10, size: 25, speed: 4.5, fireRate: 350, bSize: 5, bDmg: 1, perkName: ""
+    });
+
+    let p1 = createPlayer(200, 450, '#e74c3c', 0);
+    let p2 = createPlayer(1400, 450, '#3498db', Math.PI);
+
+    // --- NETWORK ---
+    function initPeer(id) {
+        peer = new Peer(id);
+        peer.on('error', () => initPeer(Math.floor(1000 + Math.random() * 9000).toString()));
+    }
+    initPeer(Math.floor(1000 + Math.random() * 9000).toString());
+
+    function startHost() {
+        isHost = true;
+        generateObstacles();
+        document.getElementById('host-id-display').innerText = peer.id;
+        peer.on('connection', (c) => { conn = c; setupConn(); });
+    }
+
+    function startJoin() {
+        conn = peer.connect(document.getElementById('join-id').value);
+        setupConn();
+    }
+
+    function generateObstacles() {
+        obstacles = [];
+        for(let i=0; i<7; i++) obstacles.push({ x: 500+Math.random()*600, y: 150+Math.random()*500, w: 40, h: 200 });
+    }
+
+    function setupConn() {
+        conn.on('open', () => {
+            if(isHost) conn.send({ type: 'start', obs: obstacles });
+            enterGameUI();
+        });
+        conn.on('data', (data) => {
+            let op = isHost ? p2 : p1;
+            if(data.type === 'start') { obstacles = data.obs; enterGameUI(); }
+            if(data.type === 'move') {
+                op.x = data.x; op.y = data.y; op.angle = data.angle; op.size = data.size; op.perkName = data.perk; op.hp = data.hp;
+                if(data.shot) op.bullets.push({x: data.x, y: data.y, vx: Math.cos(data.angle)*25, vy: Math.sin(data.angle)*25, s: data.bs, d: data.bd});
+            }
+            if(data.type === 'perk-spawn') perk = data.perk;
+            if(data.type === 'perk-get') { announce(data.name); perk = null; }
+            if(data.type === 'reset') applyReset(data.obs);
+        });
+    }
+
+    function enterGameUI() {
+        document.getElementById('menu').style.display = 'none';
+        document.getElementById('game-over').style.display = 'none';
+        document.getElementById('leave-btn').style.display = 'block';
+        document.querySelectorAll('.joystick-container').forEach(j => j.style.display = 'block');
+        resize(); // One more resize to ensure full screen fit
+        if(!gameRunning) { gameRunning = true; loop(); }
+    }
+
+    function hostRequestReset() {
+        generateObstacles();
+        conn.send({ type: 'reset', obs: obstacles });
+        applyReset(obstacles);
+    }
+
+    function applyReset(newObs) {
+        obstacles = newObs;
+        p1 = createPlayer(200, 450, '#e74c3c', 0);
+        p2 = createPlayer(1400, 450, '#3498db', Math.PI);
+        perk = null; perkTimer = 0;
+        document.getElementById('game-over').style.display = 'none';
+        gameRunning = true;
+    }
+
+    function announce(txt) {
+        const a = document.getElementById('announcer');
+        a.innerText = txt; a.style.display = 'block';
+        setTimeout(() => a.style.display = 'none', 1000);
+    }
+
+    // --- INPUT ---
+    const mIn = { x: 0, y: 0 }, fIn = { x: 0, y: 0, act: false };
+    function stick(id, obj) {
+        const el = document.getElementById(id), s = el.querySelector('.stick');
+        el.addEventListener('touchstart', (e) => e.preventDefault());
+        window.addEventListener('touchmove', (e) => {
+            const t = Array.from(e.touches).find(v => v.target.closest('#' + id));
+            if (!t) return;
+            const r = el.getBoundingClientRect(), dx = t.clientX - (r.left + 65), dy = t.clientY - (r.top + 65);
+            const d = Math.min(Math.sqrt(dx*dx+dy*dy), 50), a = Math.atan2(dy, dx);
+            obj.x = Math.cos(a)*(d/50); obj.y = Math.sin(a)*(d/50);
+            if(id === 'fire-stick') obj.act = true;
+            s.style.transform = `translate(${Math.cos(a)*d}px, ${Math.sin(a)*d}px)`;
+        });
+        window.addEventListener('touchend', () => { obj.x = 0; obj.y = 0; obj.act = false; s.style.transform = `translate(0,0)`; });
+    }
+    stick('move-stick', mIn); stick('fire-stick', fIn);
+
+    // --- MAIN LOOP ---
+    function loop() {
+        if (!gameRunning) { requestAnimationFrame(loop); return; }
+        let me = isHost ? p1 : p2, op = isHost ? p2 : p1;
+
+        if(isHost && !perk && Math.random() < 0.006) {
+            perk = { x: 400 + Math.random()*800, y: 200 + Math.random()*500, type: Math.floor(Math.random()*7) };
+            conn.send({ type: 'perk-spawn', perk: perk });
+        }
+
+        if(perk && Math.hypot(me.x - perk.x, me.y - perk.y) < 50) {
+            const names = ["TINY TANK", "TURBO SPEED", "RAPID FIRE", "HEAVY SHELLS", "ONE-TOUCH", "SHIELD", "SMASHER"];
+            const keys = ["tiny", "speed", "rapid", "heavy", "insta", "shield", "smasher"];
+            const idx = perk.type;
+            me.perkName = keys[idx];
+            perkTimer = Date.now() + 5000;
+            conn.send({ type: 'perk-get', name: names[idx] });
+            announce(names[idx]);
+            perk = null;
+        }
+
+        // Perk Handling (Speed & Turbo Reset Fix)
+        if(Date.now() > perkTimer) {
+            me.perkName = ""; me.speed = 4.5; me.size = 25; me.fireRate = 350; me.bSize = 5; me.bDmg = 1;
+        } else {
+            if(me.perkName === "tiny") me.size = 12;
+            if(me.perkName === "speed") me.speed = 11;
+            if(me.perkName === "rapid") me.fireRate = 80;
+            if(me.perkName === "insta") { me.fireRate = 1200; me.bDmg = 10; me.bSize = 8; }
+            if(me.perkName === "heavy") me.bSize = 25;
+            if(me.perkName === "smasher" && Math.hypot(me.x - op.x, me.y - op.y) < me.size + op.size && Date.now() - lastContactDamage > 500) {
+                op.hp -= 1; lastContactDamage = Date.now();
+            }
+        }
+
+        // Move Logic
+        let nx = me.x + mIn.x*me.speed, ny = me.y + mIn.y*me.speed;
+        let ok = nx > 40 && nx < GAME_W-40 && ny > 40 && ny < GAME_H-40;
+        obstacles.forEach(o => { if(nx > o.x-me.size && nx < o.x+o.w+me.size && ny > o.y-me.size && ny < o.y+o.h+me.size) ok = false; });
+        if(ok) { me.x = nx; me.y = ny; }
+
+        let shot = false;
+        if (fIn.act && Date.now() - lastFire > me.fireRate) {
+            me.angle = Math.atan2(fIn.y, fIn.x);
+            me.bullets.push({x: me.x, y: me.y, vx: Math.cos(me.angle)*25, vy: Math.sin(me.angle)*25, s: me.bSize, d: me.bDmg});
+            lastFire = Date.now(); shot = true;
+        }
+        conn.send({ type: 'move', x: me.x, y: me.y, angle: me.angle, shot, size: me.size, perk: me.perkName, hp: me.hp, bs: me.bSize, bd: me.bDmg });
+
+        // Physics
+        [me, op].forEach(p => {
+            p.bullets.forEach((b, i) => {
+                b.x += b.vx; b.y += b.vy;
+                obstacles.forEach(o => { if(b.x > o.x && b.x < o.x+o.w && b.y > o.y && b.y < o.y+o.h) p.bullets.splice(i, 1); });
+                if (p === op && Math.hypot(b.x-me.x, b.y-me.y) < me.size + 15) {
+                    p.bullets.splice(i, 1);
+                    if(me.perkName !== "shield") { me.hp -= b.d; if(me.hp <= 0) endGame("WASTED"); }
+                }
+                if (b.x < -100 || b.x > GAME_W+100 || b.y < -100 || b.y > GAME_H+100) p.bullets.splice(i, 1);
+            });
+        });
+        if(op.hp <= 0) endGame("VICTORY");
+
+        // DRAWING
+        ctx.clearRect(-500, -500, GAME_W+1000, GAME_H+1000);
+        ctx.strokeStyle = "#444"; ctx.lineWidth = 10; ctx.strokeRect(0, 0, GAME_W, GAME_H);
+        obstacles.forEach(o => { ctx.fillStyle = "#333"; ctx.fillRect(o.x, o.y, o.w, o.h); });
+        
+        if(perk) { 
+            ctx.fillStyle = "gold"; ctx.shadowBlur = 15; ctx.shadowColor = "gold";
+            ctx.fillRect(perk.x-20, perk.y-20, 40, 40); ctx.shadowBlur = 0;
+        }
+        
+        [me, op].forEach(p => {
+            if(p.hp <= 0) return;
+            // Bars
+            ctx.fillStyle = "#222"; ctx.fillRect(p.x-40, p.y-60, 80, 8);
+            ctx.fillStyle = p.color; ctx.fillRect(p.x-40, p.y-60, (p.hp/10)*80, 8);
+            
+            // Perk Timer
+            if(p.perkName !== "") {
+                let timeLeft = (perkTimer - Date.now()) / 5000;
+                ctx.fillStyle = "gold"; ctx.fillRect(p.x-40, p.y-75, timeLeft*80, 5);
+            }
+            
+            if(p.perkName === "shield") { ctx.strokeStyle = "cyan"; ctx.lineWidth = 5; ctx.beginPath(); ctx.arc(p.x, p.y, p.size+15, 0, 7); ctx.stroke(); }
+            if(p.perkName === "smasher") { ctx.strokeStyle = "orange"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(p.x, p.y, p.size+8, 0, 7); ctx.stroke(); }
+
+            ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.angle);
+            ctx.fillStyle = p.color; ctx.fillRect(-p.size, -p.size, p.size*2, p.size*2);
+            ctx.fillStyle = "black"; ctx.fillRect(p.size/2, -6, p.size, 12); ctx.restore();
+            p.bullets.forEach(b => { ctx.fillStyle = "yellow"; ctx.beginPath(); ctx.arc(b.x, b.y, b.s, 0, 7); ctx.fill(); });
+        });
+        requestAnimationFrame(loop);
+    }
+
+    function endGame(m) { gameRunning = false; document.getElementById('game-over').style.display='block'; document.getElementById('result-text').innerText=m; document.getElementById('restart-btn').style.display = isHost ? 'block' : 'none'; }
+</script>
+</body>
+</html>
