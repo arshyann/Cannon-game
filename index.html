@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Tank Strike: Final</title>
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        * { box-sizing: border-box; -webkit-touch-callout: none; -webkit-user-select: none; margin: 0; padding: 0; }
+        body, html { width: 100%; height: 100%; overflow: hidden; background: #000; position: fixed; font-family: 'Arial Black', sans-serif; }
+        #game-container { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; background: #000; }
+        canvas { display: block; background: #050505; touch-action: none; }
+        #ui-layer { position: absolute; inset: 0; pointer-events: none; z-index: 100; display: flex; align-items: center; justify-content: center; }
+        .menu-box { pointer-events: auto; background: rgba(0,0,0,0.95); padding: 30px; border: 5px solid #0ff; color: #0ff; text-align: center; box-shadow: 0 0 50px #0ff; border-radius: 20px; }
+        button { background: #0ff; border: none; padding: 20px 40px; font-weight: bold; font-size: 24px; cursor: pointer; border-radius: 10px; text-transform: uppercase; margin: 10px; }
+        input { padding: 15px; width: 180px; font-size: 20px; text-align:center; margin-bottom: 10px; border: 2px solid #0ff; background: #111; color: #fff; }
+        #perk-popup { position: absolute; top: 20%; left: 50%; transform: translate(-50%, -50%); font-size: 50px; color: gold; text-shadow: 0 0 20px orange; opacity: 0; transition: 0.4s; font-weight: 900; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas"></canvas>
+    <div id="ui-layer">
+        <div id="main-menu" class="menu-box">
+            <h1>TANK STRIKE</h1>
+            <p>MY ID: <span id="my-id" style="color:#fff">----</span></p>
+            <input type="number" id="join-id" placeholder="HOST ID">
+            <br>
+            <button id="btn-join" onclick="action('join')">JOIN BATTLE</button>
+            <div id="host-wait" style="display:none;">
+                <p style="color:yellow; margin: 10px 0;">PLAYER JOINED!</p>
+                <button onclick="action('start')">START BATTLE</button>
+            </div>
+        </div>
+        <div id="game-over" class="menu-box" style="display:none;">
+            <h1 id="winner-text">MATCH OVER</h1>
+            <button id="rematch-btn" onclick="action('rematch')" style="display:none;">RE-DEPLOY</button>
+        </div>
+        <div id="perk-popup">RAPID FIRE!</div>
+    </div>
+</div>
+
+<script>
+const V_WIDTH = 1920, V_HEIGHT = 1080;
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let peer, conn, isHost = false, gameActive = false;
+let obstacles = [], particles = [], goldenBox = null;
+let lastBoxTime = 0;
+
+class Tank {
+    constructor(side) {
+        this.side = side;
+        this.reset();
+    }
+    reset() {
+        if(this.side === 'host') {
+            this.x = 1750; this.y = 540; this.color = "#ff0000"; 
+        } else {
+            this.x = 170; this.y = 540; this.color = "#00aaff"; 
+        }
+        this.angle = this.side === 'host' ? Math.PI : 0;
+        this.hp = 100; this.bullets = []; this.perk = null; 
+        this.timer = 0; this.recoil = 0;
+        this.tx = this.x; this.ty = this.y; this.ta = this.angle;
+    }
+    draw() {
+        let size = this.perk === 'SMALL' ? 0.6 : 1;
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        
+        // SHIELD VISUAL
+        if(this.perk === 'SHIELD') {
+            ctx.beginPath(); ctx.arc(0,0, 90 * size, 0, Math.PI*2);
+            ctx.strokeStyle = "#0ff"; ctx.lineWidth = 5; ctx.setLineDash([10,5]);
+            ctx.stroke(); ctx.setLineDash([]);
+        }
+
+        ctx.rotate(this.angle);
+        let kick = Math.sin(this.recoil) * 25;
+        
+        // Body (With Texture)
+        ctx.fillStyle = this.color;
+        ctx.fillRect((-50 * size) - kick, -50 * size, 100 * size, 100 * size);
+        ctx.fillStyle = "rgba(0,0,0,0.2)";
+        ctx.fillRect((-30 * size) - kick, -20 * size, 20 * size, 20 * size);
+
+        // Barrel (Grey)
+        ctx.fillStyle = "#888";
+        ctx.fillRect(0 - kick, -18 * size, 95 * size, 36 * size);
+        ctx.restore();
+
+        // HUD: HP and Golden Perk Timer
+        const barW = 150;
+        ctx.fillStyle = "#222"; ctx.fillRect(this.x - barW/2, this.y - 130, barW, 15);
+        ctx.fillStyle = this.color; ctx.fillRect(this.x - barW/2, this.y - 130, (this.hp/100)*barW, 15);
+        
+        if(this.timer > 0) {
+            ctx.fillStyle = "gold"; 
+            ctx.fillRect(this.x - barW/2, this.y - 150, (this.timer/300)*barW, 8); // 300 frames = 5s
+        }
+    }
+}
+
+let p1, p2;
+
+/** 6 PERK DEFINITIONS **/
+function applyPerk(tank, type) {
+    tank.perk = type;
+    tank.timer = 300; // 5 Seconds @ 60fps
+    const pop = document.getElementById('perk-popup');
+    pop.innerText = type.replace('_', ' ') + "!";
+    pop.style.opacity = 1;
+    setTimeout(() => pop.style.opacity = 0, 1500);
+}
+
+/** SYSTEM ACTIONS **/
+async function goFull() {
+    const el = document.documentElement;
+    if (el.requestFullscreen) await el.requestFullscreen();
+    if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape').catch(()=>{});
+}
+
+function action(type) {
+    if(type === 'join') {
+        goFull();
+        const id = document.getElementById('join-id').value;
+        if(id) {
+            isHost = false; p1 = new Tank('joiner'); p2 = new Tank('host');
+            conn = peer.connect(id); setupConn();
+        }
+    } else if(type === 'start' || type === 'rematch') {
+        goFull();
+        isHost = true; p1 = new Tank('host'); p2 = new Tank('joiner');
+        obstacles = generateMap();
+        conn.send({ type: 'START', obs: obstacles });
+        startGame();
+    }
+}
+
+function generateMap() {
+    let obs = [];
+    // 3 Forced Thin/Long Rectangles
+    obs.push({x: 600, y: 200, w: 40, h: 680});
+    obs.push({x: 1280, y: 200, w: 40, h: 680});
+    obs.push({x: 940, y: 400, w: 40, h: 280});
+    // Plus 3 Random squares
+    for(let i=0; i<3; i++) {
+        obs.push({x: 700+Math.random()*500, y: 150+Math.random()*700, w: 120, h: 120});
+    }
+    return obs;
+}
+
+function setupConn() {
+    conn.on('open', () => {
+        if(isHost) {
+            document.getElementById('main-menu').querySelector('h1').innerText = "PLAYER READY";
+            document.getElementById('host-wait').style.display = 'block';
+        }
+    });
+    conn.on('data', d => {
+        if(d.type === 'START') { 
+            if(!isHost) { p1 = new Tank('joiner'); p2 = new Tank('host'); }
+            obstacles = d.obs; startGame(); 
+        }
+        if(d.type === 'SYNC') {
+            p2.x += (d.x - p2.x) * 0.35; p2.y += (d.y - p2.y) * 0.35; 
+            p2.angle = d.a; p2.hp = d.hp; p2.perk = d.perk; p2.bullets = d.bullets; p2.timer = d.t;
+        }
+        if(d.type === 'BOX') goldenBox = d.box;
+        if(d.type === 'TAKEN') goldenBox = null;
+        if(d.type === 'HIT') {
+            if(p1.perk !== 'SHIELD') { p1.hp -= d.dmg; spawnPart(p1.x, p1.y, "#f00", 25); }
+            else { spawnPart(p1.x, p1.y, "#0ff", 10); }
+        }
+    });
+}
+
+function startGame() {
+    gameActive = true; p1.reset(); p2.reset();
+    document.getElementById('main-menu').style.display = 'none';
+    document.getElementById('game-over').style.display = 'none';
+    if(isHost) document.getElementById('rematch-btn').style.display = 'block';
+    requestAnimationFrame(loop);
+}
+
+function loop() {
+    if(!gameActive) return;
+
+    // Movement
+    if(joyL.active) {
+        let s = p1.perk === 'SPEED' ? 15 : 8;
+        let a = Math.atan2(joyL.cy - joyL.y, joyL.cx - joyL.x);
+        let nx = p1.x + Math.cos(a) * s;
+        let ny = p1.y + Math.sin(a) * s;
+        if(!checkObs(nx, ny) && nx > 50 && nx < V_WIDTH-50 && ny > 50 && ny < V_HEIGHT-50) {
+            p1.x = nx; p1.y = ny;
+        }
+    }
+
+    // Firing
+    if(joyR.active) {
+        p1.angle = Math.atan2(joyR.cy - joyR.y, joyR.cx - joyR.x);
+        let cd = p1.perk === 'RAPID_FIRE' ? 120 : (p1.perk === 'ONE_TOUCH' ? 800 : 450);
+        if(Date.now() - (p1.lastFire || 0) > cd) {
+            let bRad = 12; let bDmg = 15; let bColor = p1.color; let bSpeed = 22;
+            
+            if(p1.perk === 'BIG_BULLETS') bRad = 40;
+            if(p1.perk === 'ONE_TOUCH') { bRad = 25; bDmg = 100; bColor = "yellow"; bSpeed = 18; }
+
+            p1.bullets.push({x:p1.x, y:p1.y, a:p1.angle, s:bSpeed, d: bDmg, r: bRad, c: bColor});
+            p1.recoil = Math.PI; p1.lastFire = Date.now();
+        }
+    }
+    p1.recoil *= 0.8;
+
+    // Bullet Physics - Tight Hitboxes
+    p1.bullets.forEach((b, i) => {
+        b.x += Math.cos(b.a) * b.s; b.y += Math.sin(b.a) * b.s;
+        if(checkObs(b.x, b.y, true)) p1.bullets.splice(i,1); // 'true' for bullet mode
+        else if(Math.hypot(b.x-p2.x, b.y-p2.y) < 55) {
+            conn.send({type:'HIT', dmg: b.d}); p1.bullets.splice(i,1);
+        }
+    });
+
+    // Perk Box Spawning
+    if(isHost && !goldenBox && Date.now() - lastBoxTime > 6000) {
+        let bx, by;
+        do { bx = 300+Math.random()*1300; by = 200+Math.random()*680; } while(checkObs(bx, by));
+        const pList = ['RAPID_FIRE','SHIELD','BIG_BULLETS','SPEED','SMALL','ONE_TOUCH'];
+        goldenBox = { x: bx, y: by, t: pList[Math.floor(Math.random()*pList.length)] };
+        conn.send({type:'BOX', box: goldenBox}); lastBoxTime = Date.now();
+    }
+
+    if(goldenBox && Math.hypot(p1.x-goldenBox.x, p1.y-goldenBox.y) < 80) {
+        applyPerk(p1, goldenBox.t); conn.send({type:'TAKEN'}); goldenBox = null;
+    }
+
+    if(p1.timer > 0) { p1.timer--; if(p1.timer <= 0) p1.perk = null; }
+    conn.send({type:'SYNC', x:p1.x, y:p1.y, a:p1.angle, hp:p1.hp, perk:p1.perk, bullets:p1.bullets, t:p1.timer});
+
+    render();
+    if(p1.hp <= 0 || p2.hp <= 0) {
+        gameActive = false; document.getElementById('game-over').style.display = 'block';
+        document.getElementById('winner-text').innerText = p1.hp > 0 ? "VICTORY" : "DEFEAT";
+    } else requestAnimationFrame(loop);
+}
+
+function render() {
+    const s = Math.max(window.innerWidth / V_WIDTH, window.innerHeight / V_HEIGHT);
+    canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+    ctx.setTransform(s,0,0,s,(window.innerWidth-V_WIDTH*s)/2, (window.innerHeight-V_HEIGHT*s)/2);
+
+    ctx.strokeStyle="#0ff"; ctx.lineWidth=15; ctx.strokeRect(0,0,V_WIDTH,V_HEIGHT);
+
+    obstacles.forEach(o => { 
+        ctx.fillStyle="#1a1a1a"; ctx.fillRect(o.x,o.y,o.w,o.h); 
+        ctx.strokeStyle="#0ff"; ctx.lineWidth=2; ctx.strokeRect(o.x,o.y,o.w,o.h); 
+    });
+    
+    if(goldenBox) {
+        ctx.fillStyle="gold"; ctx.shadowBlur=30; ctx.shadowColor="gold";
+        ctx.fillRect(goldenBox.x-35, goldenBox.y-35, 70, 70); ctx.shadowBlur=0;
+        ctx.fillStyle="black"; ctx.font="bold 40px Arial"; ctx.fillText("?", goldenBox.x-10, goldenBox.y+15);
+    }
+
+    p1.draw(); p2.draw();
+    [...p1.bullets, ...p2.bullets].forEach(b => {
+        ctx.fillStyle = b.c; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI*2); ctx.fill();
+    });
+
+    particles.forEach((p, i) => {
+        p.x += p.vx; p.y += p.vy; p.a -= 0.02;
+        ctx.globalAlpha = p.a; ctx.fillStyle = p.c; ctx.fillRect(p.x, p.y, 10, 10);
+        if(p.a <= 0) particles.splice(i,1);
+    });
+    ctx.globalAlpha = 1; drawJoy(joyL); drawJoy(joyR);
+}
+
+/** COLLISION & PEER **/
+function initPeer() {
+    peer = new Peer(Math.floor(1000 + Math.random() * 9000).toString());
+    peer.on('open', id => document.getElementById('my-id').innerText = id);
+    peer.on('connection', c => { conn = c; isHost = true; setupConn(); });
+}
+function checkObs(x, y, isBullet = false) {
+    let b = isBullet ? 10 : 50; // Smaller hitbox for bullets to prevent early pop
+    return obstacles.some(o => x+b > o.x && x-b < o.x+o.w && y+b > o.y && y-b < o.y+o.h);
+}
+function spawnPart(x, y, c, count) { for(let i=0; i<count; i++) particles.push({x, y, vx:(Math.random()-0.5)*18, vy:(Math.random()-0.5)*18, a:1, c}); }
+const joyL = { active: false, x: 0, y: 0, cx: 0, cy: 0, r: 100 };
+const joyR = { active: false, x: 0, y: 0, cx: 0, cy: 0, r: 100 };
+function drawJoy(j) {
+    if(!j.active) return; ctx.setTransform(1,0,0,1,0,0);
+    ctx.beginPath(); ctx.arc(j.x, j.y, j.r, 0, Math.PI*2); ctx.strokeStyle="rgba(0,255,255,0.3)"; ctx.stroke();
+    ctx.beginPath(); ctx.arc(j.cx, j.cy, 55, 0, Math.PI*2); ctx.fillStyle="rgba(0,255,255,0.5)"; ctx.fill();
+}
+function touch(e) {
+    e.preventDefault();
+    for(let t of e.touches) {
+        if(t.clientX < window.innerWidth/2) {
+            if(!joyL.active) { joyL.x = t.clientX; joyL.y = t.clientY; joyL.active = true; joyL.id = t.identifier; }
+            joyL.cx = t.clientX; joyL.cy = t.clientY;
+        } else {
+            if(!joyR.active) { joyR.x = t.clientX; joyR.y = t.clientY; joyR.active = true; joyR.id = t.identifier; }
+            joyR.cx = t.clientX; joyR.cy = t.clientY;
+        }
+    }
+}
+canvas.addEventListener('touchstart', touch, {passive:false});
+canvas.addEventListener('touchmove', touch, {passive:false});
+canvas.addEventListener('touchend', e => {
+    for(let t of e.changedTouches) {
+        if(t.identifier === joyL.id) joyL.active = false;
+        if(t.identifier === joyR.id) joyR.active = false;
+    }
+});
+initPeer();
+</script>
+</body>
+</html>
