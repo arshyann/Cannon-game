@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Tank Strike: Final</title>
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        * { box-sizing: border-box; -webkit-touch-callout: none; -webkit-user-select: none; margin: 0; padding: 0; }
+        body, html { width: 100%; height: 100%; overflow: hidden; background: #000; position: fixed; font-family: 'Arial Black', sans-serif; }
+        #game-container { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; background: #000; }
+        canvas { display: block; background: #050505; touch-action: none; }
+        #ui-layer { position: absolute; inset: 0; pointer-events: none; z-index: 100; display: flex; align-items: center; justify-content: center; }
+        .menu-box { pointer-events: auto; background: rgba(0,0,0,0.9); padding: 30px; border: 5px solid #0ff; color: #0ff; text-align: center; box-shadow: 0 0 50px #0ff; border-radius: 20px; }
+        button { background: #0ff; border: none; padding: 20px 40px; font-weight: bold; font-size: 24px; cursor: pointer; border-radius: 10px; text-transform: uppercase; margin: 10px; }
+        #status { color: #555; font-size: 14px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas"></canvas>
+    <div id="ui-layer">
+        <div id="main-menu" class="menu-box">
+            <h1>TANK STRIKE</h1>
+            <p>MY ID: <span id="my-id" style="color:#fff">----</span></p>
+            <input type="number" id="join-id" style="padding:15px; width:180px; font-size:20px; text-align:center;" placeholder="HOST ID">
+            <br>
+            <button id="btn-join" onclick="action('join')">JOIN BATTLE</button>
+            <div id="host-wait" style="display:none;">
+                <p style="color:yellow">PLAYER JOINED!</p>
+                <button onclick="action('start')">START BATTLE</button>
+            </div>
+            <p id="status">INITIALIZING SYSTEM...</p>
+        </div>
+
+        <div id="game-over" class="menu-box" style="display:none;">
+            <h1 id="winner-text">MATCH OVER</h1>
+            <button id="rematch-btn" onclick="action('rematch')" style="display:none;">RE-DEPLOY</button>
+        </div>
+    </div>
+</div>
+
+<script>
+const V_WIDTH = 1920, V_HEIGHT = 1080;
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let peer, conn, isHost = false, gameActive = false;
+let obstacles = [], particles = [], goldenBox = null;
+let lastBoxTime = 0;
+
+/** FORCED SPAWNS & COLORS **/
+// Host = Right side (Red), Joiner = Left side (Blue)
+class Tank {
+    constructor(side) {
+        this.side = side;
+        this.reset();
+    }
+    reset() {
+        if(this.side === 'host') {
+            this.x = 1700; this.y = 540; this.color = "#ff0000"; // Host Red
+        } else {
+            this.x = 220; this.y = 540; this.color = "#00aaff"; // Joiner Blue
+        }
+        this.angle = this.side === 'host' ? Math.PI : 0;
+        this.hp = 100; this.bullets = []; this.perk = null; this.timer = 0; this.recoil = 0;
+        this.tx = this.x; this.ty = this.y; this.ta = this.angle;
+    }
+    draw() {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        
+        // SHIELD EFFECT
+        if(this.perk === 'SHIELD') {
+            ctx.beginPath(); ctx.arc(0,0,85,0,Math.PI*2);
+            ctx.strokeStyle = "#0ff"; ctx.lineWidth = 5; ctx.setLineDash([10,10]);
+            ctx.stroke(); ctx.setLineDash([]);
+        }
+
+        ctx.rotate(this.angle);
+        let kick = Math.sin(this.recoil) * 25;
+        // Body
+        ctx.fillStyle = this.color;
+        ctx.fillRect(-50 - kick, -50, 100, 100);
+        // Barrel (Grey)
+        ctx.fillStyle = "#888";
+        ctx.fillRect(0 - kick, -18, 90, 36);
+        ctx.restore();
+
+        // HP Bar
+        ctx.fillStyle = "#222"; ctx.fillRect(this.x-75, this.y-120, 150, 15);
+        ctx.fillStyle = this.color; ctx.fillRect(this.x-75, this.y-120, (this.hp/100)*150, 15);
+    }
+}
+
+let p1, p2; // p1 is ALWAYS local, p2 is ALWAYS enemy
+
+/** FULLSCREEN & ROTATION FORCE **/
+async function goFullscreen() {
+    const el = document.documentElement;
+    if (el.requestFullscreen) await el.requestFullscreen();
+    if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape').catch(()=>{});
+}
+
+/** SYSTEM ACTIONS **/
+function action(type) {
+    if(type === 'join') {
+        goFullscreen();
+        const id = document.getElementById('join-id').value;
+        if(id) {
+            isHost = false;
+            p1 = new Tank('joiner'); p2 = new Tank('host');
+            conn = peer.connect(id);
+            setupConn();
+        }
+    } else if(type === 'start') {
+        goFullscreen();
+        isHost = true;
+        p1 = new Tank('host'); p2 = new Tank('joiner');
+        obstacles = generateMap();
+        conn.send({ type: 'START', obs: obstacles });
+        startGame();
+    } else if(type === 'rematch') {
+        obstacles = generateMap();
+        conn.send({ type: 'START', obs: obstacles });
+        startGame();
+    }
+}
+
+function generateMap() {
+    let obs = [];
+    // Random Map: 5-8 square blocks
+    for(let i=0; i<6; i++) {
+        obs.push({
+            x: 400 + Math.random() * 1000,
+            y: 200 + Math.random() * 600,
+            w: 120 + Math.random() * 100,
+            h: 120 + Math.random() * 100
+        });
+    }
+    return obs;
+}
+
+function setupConn() {
+    conn.on('open', () => {
+        document.getElementById('status').innerText = "CONNECTED!";
+        if(isHost) {
+            document.getElementById('btn-join').style.display = 'none';
+            document.getElementById('host-wait').style.display = 'block';
+        }
+    });
+    conn.on('data', d => {
+        if(d.type === 'START') { 
+            if(!isHost) { p1 = new Tank('joiner'); p2 = new Tank('host'); }
+            obstacles = d.obs; startGame(); 
+        }
+        if(d.type === 'SYNC') {
+            p2.x += (d.x - p2.x) * 0.3; p2.y += (d.y - p2.y) * 0.3; 
+            p2.angle = d.a; p2.hp = d.hp; p2.perk = d.perk; p2.bullets = d.bullets;
+        }
+        if(d.type === 'BOX') goldenBox = d.box;
+        if(d.type === 'TAKEN') goldenBox = null;
+        if(d.type === 'HIT') {
+            if(p1.perk !== 'SHIELD') { p1.hp -= d.dmg; spawnPart(p1.x, p1.y, "#f00", 20); }
+            else { spawnPart(p1.x, p1.y, "#0ff", 10); }
+        }
+    });
+}
+
+function startGame() {
+    gameActive = true; p1.reset(); p2.reset();
+    document.getElementById('main-menu').style.display = 'none';
+    document.getElementById('game-over').style.display = 'none';
+    if(isHost) document.getElementById('rematch-btn').style.display = 'block';
+    requestAnimationFrame(loop);
+}
+
+function loop() {
+    if(!gameActive) return;
+
+    // Movement
+    if(joyL.active) {
+        let s = p1.perk === 'PHANTOM' ? 14 : 8;
+        let a = Math.atan2(joyL.cy - joyL.y, joyL.cx - joyL.x);
+        let nx = p1.x + Math.cos(a) * s;
+        let ny = p1.y + Math.sin(a) * s;
+        if(!checkObs(nx, ny) && nx > 60 && nx < V_WIDTH-60 && ny > 60 && ny < V_HEIGHT-60) {
+            p1.x = nx; p1.y = ny;
+        }
+    }
+
+    // Firing
+    if(joyR.active) {
+        p1.angle = Math.atan2(joyR.cy - joyR.y, joyR.cx - joyR.x);
+        let cd = p1.perk === 'RAPID' ? 120 : 450;
+        if(Date.now() - (p1.lastFire || 0) > cd) {
+            let isCrit = Math.random() < 0.05;
+            // Bullet color matches tank color
+            p1.bullets.push({x:p1.x, y:p1.y, a:p1.angle, s:22, d: isCrit?100:15, r: isCrit?35:12, c: p1.color});
+            p1.recoil = Math.PI; p1.lastFire = Date.now();
+        }
+    }
+    p1.recoil *= 0.8;
+
+    p1.bullets.forEach((b, i) => {
+        b.x += Math.cos(b.a) * b.s; b.y += Math.sin(b.a) * b.s;
+        if(checkObs(b.x, b.y)) p1.bullets.splice(i,1);
+        else if(Math.hypot(b.x-p2.x, b.y-p2.y) < 60) {
+            conn.send({type:'HIT', dmg: b.d}); p1.bullets.splice(i,1);
+        }
+    });
+
+    if(isHost && !goldenBox && Date.now() - lastBoxTime > 5000) {
+        let bx, by;
+        do { bx = 300+Math.random()*1300; by = 200+Math.random()*680; } while(checkObs(bx, by));
+        goldenBox = { x: bx, y: by, t: ['RAPID','SHIELD','PHANTOM','CANNON'][Math.floor(Math.random()*4)] };
+        conn.send({type:'BOX', box: goldenBox}); lastBoxTime = Date.now();
+    }
+
+    if(goldenBox && Math.hypot(p1.x-goldenBox.x, p1.y-goldenBox.y) < 70) {
+        p1.perk = goldenBox.t; p1.timer = 480; conn.send({type:'TAKEN'}); goldenBox = null;
+    }
+
+    if(p1.timer > 0) { p1.timer--; if(p1.timer <= 0) p1.perk = null; }
+    conn.send({type:'SYNC', x:p1.x, y:p1.y, a:p1.angle, hp:p1.hp, perk:p1.perk, bullets:p1.bullets});
+
+    render();
+    if(p1.hp <= 0 || p2.hp <= 0) {
+        gameActive = false; document.getElementById('game-over').style.display = 'block';
+        document.getElementById('winner-text').innerText = p1.hp > 0 ? "VICTORY" : "DEFEAT";
+    } else requestAnimationFrame(loop);
+}
+
+function render() {
+    const s = Math.max(window.innerWidth / V_WIDTH, window.innerHeight / V_HEIGHT);
+    canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+    ctx.setTransform(s,0,0,s,(window.innerWidth-V_WIDTH*s)/2, (window.innerHeight-V_HEIGHT*s)/2);
+
+    // Neon Border
+    ctx.strokeStyle="#0ff"; ctx.lineWidth=15; ctx.strokeRect(0,0,V_WIDTH,V_HEIGHT);
+
+    obstacles.forEach(o => { ctx.fillStyle="#1a1a1a"; ctx.fillRect(o.x,o.y,o.w,o.h); ctx.strokeStyle="#0ff"; ctx.strokeRect(o.x,o.y,o.w,o.h); });
+    
+    if(goldenBox) {
+        ctx.fillStyle="gold"; ctx.shadowBlur=20; ctx.shadowColor="gold";
+        ctx.fillRect(goldenBox.x-30, goldenBox.y-30, 60, 60); ctx.shadowBlur=0;
+    }
+
+    p1.draw(); p2.draw();
+    [...p1.bullets, ...p2.bullets].forEach(b => {
+        ctx.fillStyle = b.c; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI*2); ctx.fill();
+    });
+
+    particles.forEach((p, i) => {
+        p.x += p.vx; p.y += p.vy; p.a -= 0.02;
+        ctx.globalAlpha = p.a; ctx.fillStyle = p.c; ctx.fillRect(p.x, p.y, 8, 8);
+        if(p.a <= 0) particles.splice(i,1);
+    });
+    ctx.globalAlpha = 1;
+    drawJoy(joyL); drawJoy(joyR);
+}
+
+/** HELPERS **/
+function initPeer() {
+    peer = new Peer(Math.floor(1000 + Math.random() * 9000).toString());
+    peer.on('open', id => document.getElementById('my-id').innerText = id);
+    peer.on('connection', c => { conn = c; isHost = true; setupConn(); });
+}
+function checkObs(x, y) { return obstacles.some(o => x+55 > o.x && x-55 < o.x+o.w && y+55 > o.y && y-55 < o.y+o.h); }
+function spawnPart(x, y, c, count) { for(let i=0; i<count; i++) particles.push({x, y, vx:(Math.random()-0.5)*15, vy:(Math.random()-0.5)*15, a:1, c}); }
+const joyL = { active: false, x: 0, y: 0, cx: 0, cy: 0, r: 100 };
+const joyR = { active: false, x: 0, y: 0, cx: 0, cy: 0, r: 100 };
+function drawJoy(j) {
+    if(!j.active) return; ctx.setTransform(1,0,0,1,0,0);
+    ctx.beginPath(); ctx.arc(j.x, j.y, j.r, 0, Math.PI*2); ctx.strokeStyle="rgba(0,255,255,0.3)"; ctx.stroke();
+    ctx.beginPath(); ctx.arc(j.cx, j.cy, 50, 0, Math.PI*2); ctx.fillStyle="rgba(0,255,255,0.5)"; ctx.fill();
+}
+function touch(e) {
+    e.preventDefault();
+    for(let t of e.touches) {
+        if(t.clientX < window.innerWidth/2) {
+            if(!joyL.active) { joyL.x = t.clientX; joyL.y = t.clientY; joyL.active = true; joyL.id = t.identifier; }
+            joyL.cx = t.clientX; joyL.cy = t.clientY;
+        } else {
+            if(!joyR.active) { joyR.x = t.clientX; joyR.y = t.clientY; joyR.active = true; joyR.id = t.identifier; }
+            joyR.cx = t.clientX; joyR.cy = t.clientY;
+        }
+    }
+}
+canvas.addEventListener('touchstart', touch, {passive:false});
+canvas.addEventListener('touchmove', touch, {passive:false});
+canvas.addEventListener('touchend', e => {
+    for(let t of e.changedTouches) {
+        if(t.identifier === joyL.id) joyL.active = false;
+        if(t.identifier === joyR.id) joyR.active = false;
+    }
+});
+initPeer();
+</script>
+</body>
+</html>
