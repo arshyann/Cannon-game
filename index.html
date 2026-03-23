@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Tank Strike: Tactical</title>
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        * { box-sizing: border-box; -webkit-touch-callout: none; -webkit-user-select: none; margin: 0; padding: 0; outline: none; }
+        body, html { width: 100%; height: 100%; overflow: hidden; background: #000; position: fixed; font-family: 'Arial Black', sans-serif; }
+        #game-container { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; background: #080808; }
+        canvas { display: block; background: radial-gradient(circle, #111 0%, #000 100%); touch-action: none; }
+        #ui-layer { position: absolute; inset: 0; pointer-events: none; z-index: 100; display: flex; align-items: center; justify-content: center; }
+        .menu-box { pointer-events: auto; background: rgba(0,0,5,0.9); padding: 35px; border: 4px solid #0ff; color: #0ff; text-align: center; box-shadow: 0 0 60px #044; border-radius: 15px; }
+        button { background: linear-gradient(to bottom, #0ff, #088); border: none; padding: 15px 35px; font-weight: bold; font-size: 22px; cursor: pointer; border-radius: 8px; text-transform: uppercase; margin: 12px; color: #000; box-shadow: 0 4px 0 #044; }
+        button:active { transform: translateY(3px); box-shadow: none; }
+        input { padding: 15px; width: 200px; font-size: 22px; text-align:center; margin-bottom: 12px; border: 2px solid #0ff; background: #000; color: #fff; border-radius: 5px; }
+        #perk-popup { position: absolute; top: 15%; left: 50%; transform: translate(-50%, -50%); font-size: 45px; color: #fff; text-shadow: 0 0 15px #0ff, 0 0 30px #0ff; opacity: 0; transition: 0.3s; font-weight: 900; pointer-events: none; }
+        #leave-btn { position: absolute; top: 15px; right: 15px; background: #500; color: #fff; padding: 8px 15px; border: 2px solid #f00; border-radius: 5px; pointer-events: auto; display: none; z-index: 200; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+<button id="leave-btn" onclick="leaveGame()">ABANDON</button>
+
+<div id="game-container">
+    <canvas id="gameCanvas"></canvas>
+    <div id="ui-layer">
+        <div id="main-menu" class="menu-box">
+            <h1 style="letter-spacing: 5px;">TANK STRIKE</h1>
+            <p id="net-msg" style="color:#0ff; margin-bottom:10px;">COMMS ID: <span id="my-id" style="color:#fff">----</span></p>
+            <input type="number" id="join-id" placeholder="TARGET ID">
+            <br>
+            <button onclick="action('join')">ENGAGE</button>
+            <div id="host-wait" style="display:none;">
+                <p style="color:#0f0; margin: 10px 0;">REINFORCEMENTS ARRIVED</p>
+                <button onclick="action('start')">DEPLOY UNITS</button>
+            </div>
+        </div>
+        <div id="game-over" class="menu-box" style="display:none;">
+            <h1 id="winner-text">STATUS: LOST</h1>
+            <button id="rematch-btn" onclick="action('rematch')" style="display:none;">RE-DEPLOY</button>
+            <button onclick="leaveGame()">RETREAT</button>
+        </div>
+        <div id="perk-popup">POWER UP</div>
+    </div>
+</div>
+
+<script>
+/** SFX ENGINE **/
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playSfx(f, t, d, v) {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const o = audioCtx.createOscillator(); const g = audioCtx.createGain();
+    o.type = t; o.frequency.setValueAtTime(f, audioCtx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + d);
+    g.gain.setValueAtTime(v, audioCtx.currentTime); g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + d);
+    o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime + d);
+}
+
+const V_WIDTH = 1920, V_HEIGHT = 1080;
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let peer, conn, isHost = false, gameActive = false;
+let obstacles = [], particles = [], goldenBox = null;
+let lastBoxTime = 0;
+
+class Tank {
+    constructor(side) { this.side = side; this.reset(); }
+    reset() {
+        if(this.side === 'host') { this.x = 1750; this.y = 540; this.color = "#ff3333"; this.camo = "#600"; } 
+        else { this.x = 170; this.y = 540; this.color = "#3399ff"; this.camo = "#004488"; }
+        this.angle = this.side === 'host' ? Math.PI : 0;
+        this.hp = 100; this.bullets = []; this.perk = null; this.timer = 0; this.recoil = 0;
+        this.tx = this.x; this.ty = this.y;
+    }
+    draw() {
+        let s = this.perk === 'SMALL' ? 0.6 : 1;
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        
+        // Shield Glow
+        if(this.perk === 'SHIELD') {
+            ctx.shadowBlur = 20; ctx.shadowColor = "#0ff";
+            ctx.beginPath(); ctx.arc(0,0, 100*s, 0, Math.PI*2);
+            ctx.strokeStyle = "rgba(0,255,255,0.5)"; ctx.lineWidth = 8; ctx.stroke();
+            ctx.shadowBlur = 0;
+        }
+
+        ctx.rotate(this.angle);
+        let k = Math.sin(this.recoil) * 25;
+        
+        // Tread Shadows
+        ctx.fillStyle = "rgba(0,0,0,0.5)";
+        ctx.fillRect(-60*s-k, -55*s, 120*s, 20*s);
+        ctx.fillRect(-60*s-k, 35*s, 120*s, 20*s);
+
+        // Body with Camo Texture
+        ctx.fillStyle = this.color;
+        ctx.fillRect(-50*s-k, -50*s, 100*s, 100*s);
+        ctx.fillStyle = this.camo;
+        ctx.fillRect(-30*s-k, -40*s, 25*s, 30*s);
+        ctx.fillRect(10*s-k, 10*s, 25*s, 30*s);
+        ctx.fillRect(-40*s-k, 20*s, 15*s, 15*s);
+
+        // Turret Detail
+        ctx.fillStyle = "#333";
+        ctx.fillRect(-25*s-k, -25*s, 50*s, 50*s);
+        ctx.strokeStyle = this.color; ctx.lineWidth = 2;
+        ctx.strokeRect(-25*s-k, -25*s, 50*s, 50*s);
+
+        // Barrel with Texture
+        let grad = ctx.createLinearGradient(0, -18*s, 0, 18*s);
+        grad.addColorStop(0, "#444"); grad.addColorStop(0.5, "#999"); grad.addColorStop(1, "#444");
+        ctx.fillStyle = grad;
+        ctx.fillRect(0-k, -18*s, 100*s, 36*s);
+        ctx.strokeStyle = "#000"; ctx.strokeRect(0-k, -18*s, 100*s, 36*s);
+        
+        ctx.restore();
+
+        // HP and Perk Bar
+        const bw = 160;
+        ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(this.x-bw/2, this.y-140, bw, 12);
+        ctx.fillStyle = this.color; ctx.fillRect(this.x-bw/2, this.y-140, (this.hp/100)*bw, 12);
+        if(this.timer > 0) {
+            ctx.fillStyle = "#ff0"; ctx.fillRect(this.x-bw/2, this.y-155, (this.timer/300)*bw, 6);
+        }
+    }
+}
+
+let p1, p2;
+
+function moveTank(t, j) {
+    let spd = t.perk === 'SPEED' ? 15 : 8;
+    let ang = Math.atan2(j.cy - j.y, j.cx - j.x);
+    let vx = Math.cos(ang) * spd, vy = Math.sin(ang) * spd;
+    if (!checkObs(t.x + vx, t.y + vy) && inBounds(t.x + vx, t.y + vy)) { t.x += vx; t.y += vy; } 
+    else if (!checkObs(t.x + vx, t.y) && inBounds(t.x + vx, t.y)) { t.x += vx; } 
+    else if (!checkObs(t.x, t.y + vy) && inBounds(t.x, t.y + vy)) { t.y += vy; }
+}
+function inBounds(x, y) { return x > 65 && x < V_WIDTH - 65 && y > 65 && y < V_HEIGHT - 65; }
+
+function action(type) {
+    audioCtx.resume();
+    if(type === 'join') {
+        const id = document.getElementById('join-id').value;
+        if(id) { goFull(); isHost = false; p1 = new Tank('joiner'); p2 = new Tank('host'); conn = peer.connect(id); setupConn(); }
+    } else if(type === 'start' || type === 'rematch') {
+        goFull(); isHost = true; p1 = new Tank('host'); p2 = new Tank('joiner');
+        obstacles = generateMap(); conn.send({ type: 'START', obs: obstacles }); startGame();
+    }
+}
+
+function generateMap() {
+    let obs = [];
+    for(let i=0; i<8; i++) obs.push({ x: 400 + Math.random() * 1100, y: 150 + Math.random() * 700, w: 140, h: 140 });
+    return obs;
+}
+
+function setupConn() {
+    conn.on('open', () => { if(isHost) document.getElementById('host-wait').style.display = 'block'; });
+    conn.on('data', d => {
+        if(d.type === 'START') { obstacles = d.obs; startGame(); }
+        if(d.type === 'SYNC') { p2.x += (d.x - p2.x) * 0.35; p2.y += (d.y - p2.y) * 0.35; p2.angle = d.a; p2.hp = d.hp; p2.perk = d.perk; p2.bullets = d.bullets; p2.timer = d.t; }
+        if(d.type === 'BOX') goldenBox = d.box;
+        if(d.type === 'TAKEN') { goldenBox = null; playSfx(600, 'square', 0.2, 0.2); }
+        if(d.type === 'HIT') { if(p1.perk !== 'SHIELD') { p1.hp -= d.dmg; spawnPart(p1.x, p1.y, "#f33", 30); playSfx(120, 'sawtooth', 0.4, 0.4); } }
+        if(d.type === 'LEAVE') playerLeft();
+    });
+    conn.on('close', playerLeft);
+}
+
+function playerLeft() { gameActive = false; document.getElementById('main-menu').style.display = 'block'; document.getElementById('game-over').style.display = 'none'; document.getElementById('leave-btn').style.display = 'none'; document.getElementById('net-msg').innerHTML = "<span style='color:red'>OPERATOR DISCONNECTED</span>"; }
+function leaveGame() { if(conn) conn.send({type:'LEAVE'}); location.reload(); }
+async function goFull() { const el = document.documentElement; if (el.requestFullscreen) await el.requestFullscreen(); if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape').catch(()=>{}); }
+
+function startGame() { gameActive = true; p1.reset(); p2.reset(); document.getElementById('main-menu').style.display = 'none'; document.getElementById('game-over').style.display = 'none'; document.getElementById('leave-btn').style.display = 'block'; if(isHost) document.getElementById('rematch-btn').style.display = 'block'; requestAnimationFrame(loop); }
+
+function loop() {
+    if(!gameActive) return;
+    if(joyL.active) moveTank(p1, joyL);
+    if(joyR.active) {
+        p1.angle = Math.atan2(joyR.cy - joyR.y, joyR.cx - joyR.x);
+        let cd = p1.perk === 'RAPID_FIRE' ? 120 : (p1.perk === 'ONE_TOUCH' ? 850 : 450);
+        if(Date.now() - (p1.lastFire || 0) > cd) {
+            let bR = 14, bD = 15, bC = p1.color, bS = 24;
+            if(p1.perk === 'BIG_BULLETS') bR = 48;
+            if(p1.perk === 'ONE_TOUCH') { bR = 32; bD = 100; bC = "#ffff00"; bS = 18; }
+            p1.bullets.push({x:p1.x, y:p1.y, a:p1.angle, s:bS, d: bD, r: bR, c: bC});
+            p1.recoil = Math.PI; p1.lastFire = Date.now();
+            playSfx(p1.perk === 'ONE_TOUCH' ? 180 : 350, 'triangle', 0.2, 0.3);
+        }
+    }
+    p1.recoil *= 0.82;
+
+    p1.bullets.forEach((b, i) => {
+        b.x += Math.cos(b.a) * b.s; b.y += Math.sin(b.a) * b.s;
+        if(checkObs(b.x, b.y, true)) { p1.bullets.splice(i,1); playSfx(100, 'sine', 0.1, 0.1); }
+        else if(Math.hypot(b.x-p2.x, b.y-p2.y) < 60) { conn.send({type:'HIT', dmg: b.d}); p1.bullets.splice(i,1); spawnPart(b.x, b.y, b.c, 15); }
+    });
+
+    if(isHost && !goldenBox && Date.now() - lastBoxTime > 6500) {
+        let bx, by; do { bx = 450+Math.random()*1000; by = 200+Math.random()*600; } while(checkObs(bx, by));
+        goldenBox = { x: bx, y: by, t: ['RAPID_FIRE','SHIELD','BIG_BULLETS','SPEED','SMALL','ONE_TOUCH'][Math.floor(Math.random()*6)] };
+        conn.send({type:'BOX', box: goldenBox}); lastBoxTime = Date.now();
+    }
+
+    if(goldenBox && Math.hypot(p1.x-goldenBox.x, p1.y-goldenBox.y) < 85) {
+        p1.perk = goldenBox.t; p1.timer = 300; playSfx(900, 'sine', 0.3, 0.2);
+        const pop = document.getElementById('perk-popup'); pop.innerText = p1.perk.replace('_',' ')+"!";
+        pop.style.opacity = 1; setTimeout(()=>pop.style.opacity = 0, 1000);
+        conn.send({type:'TAKEN'}); goldenBox = null;
+    }
+
+    if(p1.timer > 0) { p1.timer--; if(p1.timer <= 0) p1.perk = null; }
+    conn.send({type:'SYNC', x:p1.x, y:p1.y, a:p1.angle, hp:p1.hp, perk:p1.perk, bullets:p1.bullets, t:p1.timer});
+    render();
+    if(p1.hp <= 0 || p2.hp <= 0) { gameActive = false; document.getElementById('game-over').style.display = 'block'; document.getElementById('winner-text').innerText = p1.hp > 0 ? "MISSION SUCCESS" : "MISSION FAILED"; } 
+    else requestAnimationFrame(loop);
+}
+
+function render() {
+    const s = Math.max(window.innerWidth / V_WIDTH, window.innerHeight / V_HEIGHT);
+    canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+    ctx.setTransform(s,0,0,s,(window.innerWidth-V_WIDTH*s)/2, (window.innerHeight-V_HEIGHT*s)/2);
+
+    // Floor Grid Texture
+    ctx.strokeStyle = "rgba(0, 255, 255, 0.05)"; ctx.lineWidth = 1;
+    for(let i=0; i<V_WIDTH; i+=100) { ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,V_HEIGHT); ctx.stroke(); }
+    for(let j=0; j<V_HEIGHT; j+=100) { ctx.beginPath(); ctx.moveTo(0,j); ctx.lineTo(V_WIDTH,j); ctx.stroke(); }
+
+    ctx.strokeStyle="#0ff"; ctx.lineWidth=10; ctx.strokeRect(0,0,V_WIDTH,V_HEIGHT);
+    
+    // Obstacles with 3D Depth
+    obstacles.forEach(o => { 
+        ctx.fillStyle="#000"; ctx.fillRect(o.x+10,o.y+10,o.w,o.h); // Shadow
+        ctx.fillStyle="#222"; ctx.fillRect(o.x,o.y,o.w,o.h); // Top
+        ctx.strokeStyle="#0ff"; ctx.lineWidth=2; ctx.strokeRect(o.x,o.y,o.w,o.h);
+        // Bevel lines
+        ctx.strokeStyle="rgba(255,255,255,0.1)";
+        ctx.beginPath(); ctx.moveTo(o.x,o.y); ctx.lineTo(o.x+o.w,o.y+o.h); ctx.stroke();
+    });
+    
+    if(goldenBox) { 
+        ctx.save(); ctx.translate(goldenBox.x, goldenBox.y); ctx.rotate(Date.now()*0.002);
+        let g = ctx.createRadialGradient(0,0,5,0,0,40); g.addColorStop(0,"#fff"); g.addColorStop(1,"gold");
+        ctx.fillStyle=g; ctx.shadowBlur=30; ctx.shadowColor="gold"; ctx.fillRect(-35,-35,70,70); ctx.restore();
+    }
+
+    p1.draw(); p2.draw();
+
+    // Glowing Bullets
+    [...p1.bullets, ...p2.bullets].forEach(b => {
+        let rg = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.r);
+        rg.addColorStop(0, "#fff"); rg.addColorStop(0.4, b.c); rg.addColorStop(1, "transparent");
+        ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(b.x, b.y, b.r*1.5, 0, Math.PI*2); ctx.fill();
+    });
+
+    particles.forEach((p, i) => { p.x += p.vx; p.y += p.vy; p.a -= 0.02; ctx.globalAlpha = p.a; ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI*2); ctx.fill(); if(p.a <= 0) particles.splice(i,1); });
+    ctx.globalAlpha = 1; drawJoy(joyL); drawJoy(joyR);
+}
+
+function initPeer() { peer = new Peer(Math.floor(1000 + Math.random() * 9000).toString()); peer.on('open', id => document.getElementById('my-id').innerText = id); peer.on('connection', c => { conn = c; isHost = true; setupConn(); }); }
+function checkObs(x, y, isB = false) { let b = isB ? 10 : 55; return obstacles.some(o => x+b > o.x && x-b < o.x+o.w && y+b > o.y && y-b < o.y+o.h); }
+function spawnPart(x, y, c, count) { for(let i=0; i<count; i++) particles.push({x, y, vx:(Math.random()-0.5)*20, vy:(Math.random()-0.5)*20, a:1, c}); }
+const joyL = { active: false, x: 0, y: 0, cx: 0, cy: 0, r: 100 }, joyR = { active: false, x: 0, y: 0, cx: 0, cy: 0, r: 100 };
+function drawJoy(j) { if(!j.active) return; ctx.setTransform(1,0,0,1,0,0); ctx.beginPath(); ctx.arc(j.x, j.y, j.r, 0, Math.PI*2); ctx.strokeStyle="rgba(0,255,255,0.2)"; ctx.stroke(); ctx.beginPath(); ctx.arc(j.cx, j.cy, 55, 0, Math.PI*2); ctx.fillStyle="rgba(0,255,255,0.4)"; ctx.fill(); }
+function touch(e) { e.preventDefault(); for(let t of e.touches) { if(t.clientX < window.innerWidth/2) { if(!joyL.active) { joyL.x = t.clientX; joyL.y = t.clientY; joyL.active = true; joyL.id = t.identifier; } joyL.cx = t.clientX; joyL.cy = t.clientY; } else { if(!joyR.active) { joyR.x = t.clientX; joyR.y = t.clientY; joyR.active = true; joyR.id = t.identifier; } joyR.cx = t.clientX; joyR.cy = t.clientY; } } }
+canvas.addEventListener('touchstart', touch, {passive:false}); canvas.addEventListener('touchmove', touch, {passive:false}); canvas.addEventListener('touchend', e => { for(let t of e.changedTouches) { if(t.identifier === joyL.id) joyL.active = false; if(t.identifier === joyR.id) joyR.active = false; } });
+initPeer();
+</script>
+</body>
+</html>
